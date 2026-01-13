@@ -1,8 +1,9 @@
 import re
 import time
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from urllib.parse import urlparse
+from typing import Optional, Dict, Any, Tuple, List
 
 import streamlit as st
 import requests
@@ -11,26 +12,35 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib import colors
 
-# ----------------------------
-# AIRE™ — Institutional Underwriter (Demo-Ready)
-# ----------------------------
+# =====================================
+# AIRE™ — Production-ish Streamlit App
+# =====================================
 APP_NAME = "AIRE™"
+APP_TAGLINE = "Institutional underwriting, simplified."
 DB_PATH = "aire_app.db"
-FREE_ANALYSES = 2  # free runs per email
 
-DEFAULT_ACCENT = "#0B2E4A"   # deep navy
-DEFAULT_ACCENT_2 = "#16A34A" # premium green
+# Plans / metering
+FREE_CREDITS = 2        # free analyses per email
+PRO_CREDITS = 5000      # effectively "unlimited" for MVP
+CREDIT_COST_PER_ANALYSIS = 1
+
+# UI Theme vars (kept for CSS only; Streamlit theme set in config.toml)
 SOFT_BG = "#F6F8FB"
 CARD_BG = "#FFFFFF"
 MUTED = "#6B7280"
+ACCENT = "#0B2E4A"
+SUCCESS = "#16A34A"
+WARN = "#B45309"
+DANGER = "#B91C1C"
 
-st.set_page_config(page_title=f"{APP_NAME} Property Grader", page_icon="🏠", layout="wide")
+st.set_page_config(page_title=f"{APP_NAME} | Property Grader", page_icon="🏠", layout="wide")
 
-CSS = f"""<style>
+CSS = f"""
+<style>
   .main {{ background: {SOFT_BG}; }}
   .block-container {{ padding-top: 1.25rem; padding-bottom: 2.5rem; max-width: 1200px; }}
-  .aire-header {{
-    background: linear-gradient(90deg, {DEFAULT_ACCENT} 0%, #0F3D63 55%, #1C5D8B 100%);
+  .aire-hero {{
+    background: linear-gradient(90deg, {ACCENT} 0%, #0F3D63 55%, #1C5D8B 100%);
     color: white;
     padding: 22px 22px;
     border-radius: 18px;
@@ -45,40 +55,68 @@ CSS = f"""<style>
     box-shadow: 0 10px 20px rgba(0,0,0,.06);
     border: 1px solid rgba(15, 23, 42, .06);
   }}
-  .aire-chip {{
-    display:inline-block;
-    padding: 6px 10px;
-    border-radius: 999px;
-    background: rgba(22,163,74,.10);
-    color: {DEFAULT_ACCENT_2};
-    font-weight: 700;
-    font-size: 12px;
-    margin-right: 8px;
-  }}
   .aire-kpi {{
     background: {CARD_BG};
     border-radius: 18px;
     padding: 14px 14px;
     border: 1px solid rgba(15, 23, 42, .06);
   }}
+  .aire-muted {{ color: {MUTED}; }}
   .stButton>button, .stDownloadButton>button {{
     border-radius: 12px;
     padding: 10px 14px;
     font-weight: 700;
   }}
-</style>"""
+  .aire-pill {{
+    display:inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(22,163,74,.10);
+    color: {SUCCESS};
+    font-weight: 800;
+    font-size: 12px;
+    margin-right: 8px;
+  }}
+  .aire-pill-warn {{
+    display:inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(180,83,9,.12);
+    color: {WARN};
+    font-weight: 800;
+    font-size: 12px;
+    margin-right: 8px;
+  }}
+  .aire-pill-danger {{
+    display:inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(185,28,28,.10);
+    color: {DANGER};
+    font-weight: 800;
+    font-size: 12px;
+    margin-right: 8px;
+  }}
+  .aire-disclaimer {{
+    font-size: 12px;
+    color: {MUTED};
+  }}
+</style>
+"""
 st.markdown(CSS, unsafe_allow_html=True)
 
 # ----------------------------
-# Data Model
+# Data model
 # ----------------------------
 @dataclass
 class PropertyData:
     address: str
     price: float
+    down_payment_pct: float
+    interest_rate_pct: float
+    term_years: int
     monthly_rent: float
     monthly_expenses: float
-    loan_payment: float
     vacancy_rate: float
     replacement_cost: float
     days_on_market: int
@@ -86,56 +124,135 @@ class PropertyData:
     rent_regulation_risk: bool
 
 # ----------------------------
-# DB: usage + subscription flag (simple MVP)
+# Database
 # ----------------------------
 def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             email TEXT PRIMARY KEY,
-            analyses_used INTEGER DEFAULT 0,
+            credits INTEGER DEFAULT 0,
             paid INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT 0,
             updated_at INTEGER DEFAULT 0
         )
-        """
-    )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            address TEXT,
+            listing_url TEXT,
+            grade TEXT,
+            verdict TEXT,
+            score REAL,
+            dscr REAL,
+            noi REAL,
+            cap_rate REAL,
+            coc_return REAL,
+            json_payload TEXT
+        )
+    """)
     conn.commit()
     return conn
 
-def get_user(email: str):
+def _now() -> int:
+    return int(time.time())
+
+def get_user(email: str) -> Dict[str, Any]:
     conn = _db()
-    cur = conn.execute("SELECT email, analyses_used, paid FROM users WHERE email=?", (email,))
+    cur = conn.execute("SELECT email, credits, paid FROM users WHERE email=?", (email,))
     row = cur.fetchone()
+    now = _now()
     if not row:
         conn.execute(
-            "INSERT INTO users(email, analyses_used, paid, updated_at) VALUES(?,?,?,?)",
-            (email, 0, 0, int(time.time())),
+            "INSERT INTO users(email, credits, paid, created_at, updated_at) VALUES(?,?,?,?,?)",
+            (email, FREE_CREDITS, 0, now, now),
         )
         conn.commit()
-        return {"email": email, "analyses_used": 0, "paid": 0}
-    return {"email": row[0], "analyses_used": row[1], "paid": row[2]}
-
-def inc_usage(email: str):
-    conn = _db()
-    conn.execute(
-        "UPDATE users SET analyses_used = analyses_used + 1, updated_at=? WHERE email=?",
-        (int(time.time()), email),
-    )
-    conn.commit()
+        return {"email": email, "credits": FREE_CREDITS, "paid": 0}
+    return {"email": row[0], "credits": int(row[1]), "paid": int(row[2])}
 
 def set_paid(email: str, paid: int = 1):
     conn = _db()
+    credits = PRO_CREDITS if paid else FREE_CREDITS
+    conn.execute("UPDATE users SET paid=?, credits=?, updated_at=? WHERE email=?", (paid, credits, _now(), email))
+    conn.commit()
+
+def spend_credit(email: str, amount: int = CREDIT_COST_PER_ANALYSIS) -> bool:
+    conn = _db()
+    cur = conn.execute("SELECT credits, paid FROM users WHERE email=?", (email,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    credits, paid = int(row[0]), int(row[1])
+    if paid:
+        return True
+    if credits < amount:
+        return False
+    conn.execute("UPDATE users SET credits = credits - ?, updated_at=? WHERE email=?", (amount, _now(), email))
+    conn.commit()
+    return True
+
+def json_dumps(obj: Any) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False)
+
+def save_analysis(email: str, address: str, listing_url: str, result: Dict[str, Any], payload: Dict[str, Any]):
+    conn = _db()
     conn.execute(
-        "UPDATE users SET paid=?, updated_at=? WHERE email=?",
-        (paid, int(time.time()), email),
+        """INSERT INTO analyses(email, created_at, address, listing_url, grade, verdict, score, dscr, noi, cap_rate, coc_return, json_payload)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            email,
+            _now(),
+            address,
+            listing_url,
+            result.get("grade"),
+            result.get("verdict"),
+            float(result.get("score", 0)),
+            float(result.get("dscr", 0)),
+            float(result.get("noi", 0)),
+            float(result.get("cap_rate", 0)),
+            float(result.get("coc_return", 0)),
+            json_dumps(payload),
+        ),
     )
     conn.commit()
+
+def fetch_analyses(email: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _db()
+    cur = conn.execute(
+        "SELECT created_at, address, listing_url, grade, verdict, score, dscr, noi, cap_rate, coc_return FROM analyses WHERE email=? ORDER BY created_at DESC LIMIT ?",
+        (email, limit),
+    )
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "created_at": int(r[0]), "address": r[1], "listing_url": r[2],
+            "grade": r[3], "verdict": r[4], "score": r[5],
+            "dscr": r[6], "noi": r[7], "cap_rate": r[8], "coc_return": r[9],
+        })
+    return out
+
+# ----------------------------
+# Formatting helpers
+# ----------------------------
+def fmt_money(x: float) -> str:
+    try:
+        return f"${x:,.0f}"
+    except Exception:
+        return str(x)
+
+def ts_to_str(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 # ----------------------------
 # URL → Address (NO scraping)
 # ----------------------------
-def extract_address_from_url(url: str) -> str | None:
+def extract_address_from_url(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
         path = parsed.path.strip("/")
@@ -155,7 +272,8 @@ def extract_address_from_url(url: str) -> str | None:
 # ----------------------------
 # Real Data Connectors (LEGAL)
 # ----------------------------
-def fetch_estated(address: str):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_estated(address: str) -> Optional[Dict[str, Any]]:
     token = st.secrets.get("ESTATED_TOKEN", None)
     if not token:
         return None
@@ -166,7 +284,8 @@ def fetch_estated(address: str):
         return None
     return r.json()
 
-def fetch_attom(address: str):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_attom(address: str) -> Optional[Dict[str, Any]]:
     apikey = st.secrets.get("ATTOM_APIKEY", None)
     if not apikey:
         return None
@@ -178,13 +297,19 @@ def fetch_attom(address: str):
         return None
     return r.json()
 
-def smart_prefill(address: str):
-    suggested = {"price": None, "days_on_market": None, "replacement_cost": None}
+def smart_prefill(address: str) -> Tuple[Dict[str, Any], List[str]]:
+    suggested = {"price": None, "replacement_cost": None, "days_on_market": None}
+    notes = []
 
     est = fetch_estated(address)
     if isinstance(est, dict):
         valuation = est.get("valuation", {}) or {}
-        suggested["price"] = valuation.get("market_value") or valuation.get("value") or None
+        price = valuation.get("market_value") or valuation.get("value")
+        if price:
+            suggested["price"] = float(price)
+            notes.append("Pulled estimated value from Estated.")
+        else:
+            notes.append("Estated available, but no valuation field found.")
 
     att = fetch_attom(address)
     if isinstance(att, dict):
@@ -195,75 +320,95 @@ def smart_prefill(address: str):
             if isinstance(prop, dict):
                 sale = prop.get("sale", {}) or {}
                 assessment = prop.get("assessment", {}) or {}
-                suggested["price"] = suggested["price"] or sale.get("amount") or assessment.get("market", {}).get("mktTtlValue")
+                p2 = sale.get("amount") or assessment.get("market", {}).get("mktTtlValue")
+                if p2 and not suggested["price"]:
+                    suggested["price"] = float(p2)
+                    notes.append("Pulled price/value from ATTOM.")
         except Exception:
-            pass
+            notes.append("ATTOM available, but response shape differed.")
 
-    return suggested
+    if not notes:
+        notes.append("No API keys set — manual mode.")
+    return suggested, notes
 
 # ----------------------------
-# AIRE™ Underwriting (deterministic)
+# Finance + Underwriting
 # ----------------------------
+def monthly_payment(principal: float, annual_rate_pct: float, term_years: int) -> float:
+    r = (annual_rate_pct / 100) / 12.0
+    n = term_years * 12
+    if r <= 0:
+        return principal / max(n, 1)
+    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
 def get_weights(rate_env: str):
     if rate_env.upper() == "HIGH":
-        return {"cashflow": 0.30, "downside": 0.25, "location": 0.15, "yield": 0.10, "liquidity": 0.10, "optionality": 0.05, "ai_risk": 0.05}
-    return {"cashflow": 0.25, "downside": 0.20, "location": 0.15, "yield": 0.15, "liquidity": 0.10, "optionality": 0.10, "ai_risk": 0.05}
+        return {"cashflow": 0.32, "downside": 0.25, "location": 0.12, "yield": 0.10, "liquidity": 0.10, "optionality": 0.06, "ai_risk": 0.05}
+    return {"cashflow": 0.28, "downside": 0.20, "location": 0.12, "yield": 0.15, "liquidity": 0.10, "optionality": 0.10, "ai_risk": 0.05}
 
-def kill_switch(p: PropertyData) -> bool:
-    stressed_rent = p.monthly_rent * 0.80
-    net = stressed_rent - p.monthly_expenses
-    dscr = net / max(p.loan_payment, 1.0)
-    if dscr < 1.0:
-        return True
-    if p.rent_regulation_risk:
-        return True
-    if p.days_on_market > 180:
-        return True
-    return False
+def kill_switch(dscr_stress: float, rent_reg_risk: bool, dom: int) -> bool:
+    return (dscr_stress < 1.0) or rent_reg_risk or (dom > 180)
 
-def calculate_metrics(p: PropertyData):
-    stressed_rent = p.monthly_rent * 0.80
-    net = stressed_rent - p.monthly_expenses
-    dscr = net / max(p.loan_payment, 1.0)
+def compute_core_numbers(p: PropertyData) -> Dict[str, float]:
+    loan_amount = p.price * (1 - p.down_payment_pct / 100)
+    pay = monthly_payment(loan_amount, p.interest_rate_pct, p.term_years)
 
-    cashflow = max(0.0, min(dscr / 1.50, 1.0))
+    eff_rent = p.monthly_rent * (1 - p.vacancy_rate)
+    noi_month = eff_rent - p.monthly_expenses
+    noi_year = noi_month * 12
+
+    cap_rate = noi_year / max(p.price, 1.0)
+
+    cash_flow_month = noi_month - pay
+    cash_flow_year = cash_flow_month * 12
+    cash_invested = p.price * (p.down_payment_pct / 100)
+    coc = cash_flow_year / max(cash_invested, 1.0)
+
+    stressed_rent = p.monthly_rent * 0.80 * (1 - p.vacancy_rate)
+    stressed_noi_m = stressed_rent - p.monthly_expenses
+    dscr = stressed_noi_m / max(pay, 1.0)
+
+    return {"loan_payment": pay, "noi_year": noi_year, "cap_rate": cap_rate, "coc_return": coc, "dscr_stress": dscr, "cash_flow_month": cash_flow_month}
+
+def calculate_metrics(p: PropertyData, nums: Dict[str, float]) -> Dict[str, float]:
+    cashflow = max(0.0, min(nums["dscr_stress"] / 1.50, 1.0))
     downside = max(0.0, min((p.replacement_cost / max(p.price, 1.0)) / 1.20, 1.0))
     location = max(0.0, min(p.job_diversity_index, 1.0))
-    yld = (p.monthly_rent * 12) / max(p.price, 1.0)
-    yield_quality = max(0.0, min(yld / 0.12, 1.0))
+    yield_quality = max(0.0, min(nums["cap_rate"] / 0.10, 1.0))
     liquidity = max(0.0, 1 - (p.days_on_market / 180))
-    optionality = 0.60
-    ai_risk = 1.0
+    return {"cashflow": cashflow, "downside": downside, "location": location, "yield": yield_quality, "liquidity": liquidity, "optionality": 0.60, "ai_risk": 1.0}
 
-    metrics = {"cashflow": cashflow, "downside": downside, "location": location, "yield": yield_quality, "liquidity": liquidity, "optionality": optionality, "ai_risk": ai_risk}
-    return metrics, float(dscr)
-
-def ai_flags(p: PropertyData):
+def ai_flags(p: PropertyData, nums: Dict[str, float]) -> List[str]:
     flags = []
-    if (p.monthly_rent * 12) / max(p.price, 1.0) > 0.14:
-        flags.append("Overstated yield vs price")
+    gross_yield = (p.monthly_rent * 12) / max(p.price, 1.0)
+    if gross_yield > 0.14:
+        flags.append("Rent-to-price looks aggressive (verify comps).")
     if p.vacancy_rate < 0.05:
-        flags.append("Vacancy assumption looks optimistic")
-    if p.rent_regulation_risk:
-        flags.append("Regulatory pressure risk")
+        flags.append("Vacancy assumption looks optimistic.")
     if p.monthly_expenses < (p.monthly_rent * 0.20):
-        flags.append("Expenses might be understated")
+        flags.append("Expenses might be understated.")
+    if nums["cap_rate"] < 0.045:
+        flags.append("Low cap rate; deal relies on appreciation/execution.")
+    if p.rent_regulation_risk:
+        flags.append("Regulatory pressure risk.")
     return flags
 
-def ai_penalty(flags):
+def ai_penalty(flags: List[str]) -> float:
     base = 0.0
     for f in flags:
-        if "Overstated" in f:
-            base += 0.05
+        if "aggressive" in f:
+            base += 0.06
         elif "Vacancy" in f:
             base += 0.08
-        elif "Regulatory" in f:
-            base += 0.20
         elif "Expenses" in f:
             base += 0.06
+        elif "Low cap" in f:
+            base += 0.06
+        elif "Regulatory" in f:
+            base += 0.20
     return min(base, 0.35)
 
-def score(metrics, weights):
+def score(metrics: Dict[str, float], weights: Dict[str, float]) -> float:
     return sum(metrics[k] * weights[k] for k in metrics) * 100
 
 def grade(score_val: float, killed: bool):
@@ -279,50 +424,45 @@ def grade(score_val: float, killed: bool):
         return "D", "SPECULATIVE"
     return "F", "PASS"
 
-def narrative_summary(p: PropertyData, score_val: float, g: str, verdict: str, flags: list, dscr: float):
+def narrative_summary(p: PropertyData, nums: Dict[str, float], flags: List[str]):
     strengths = []
     risks = flags[:] if flags else []
-
-    if dscr >= 1.25:
-        strengths.append("Strong stress-tested cash flow (DSCR ≥ 1.25).")
+    if nums["dscr_stress"] >= 1.25:
+        strengths.append("Strong stress-tested coverage (DSCR ≥ 1.25).")
+    if nums["cap_rate"] >= 0.07:
+        strengths.append("Healthy cap rate relative to price and expenses.")
     if p.replacement_cost >= p.price:
-        strengths.append("Downside buffer: priced at/below replacement cost.")
+        strengths.append("Downside buffer: at/below replacement cost.")
     if p.days_on_market <= 45:
-        strengths.append("Healthy liquidity profile (fast exit).")
-
+        strengths.append("Liquidity profile looks solid (faster exit).")
     if not strengths:
-        strengths.append("Neutral strength profile: upside depends on execution and pricing discipline.")
-
+        strengths.append("Neutral strength profile; upside depends on execution and pricing discipline.")
     if not risks:
-        risks.append("No major risk flags detected; verify rents/expenses with comps.")
+        risks.append("No major risk flags detected; validate rent comps and true expenses.")
+    return strengths[:3], risks[:4]
 
-    return strengths[:3], risks[:3]
-
-# ----------------------------
-# PDF Report
-# ----------------------------
-def build_pdf(path: str, p: PropertyData, result: dict, strengths: list, risks: list, dscr: float):
+def build_pdf(path: str, p: PropertyData, nums: Dict[str, float], result: Dict[str, Any], strengths: List[str], risks: List[str], data_notes: List[str]):
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(path, pagesize=LETTER)
     story = []
-
-    story.append(Paragraph(f"{APP_NAME} Investment Report", styles["Title"]))
-    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"{APP_NAME} — Investment Report", styles["Title"]))
+    story.append(Spacer(1, 8))
     story.append(Paragraph(f"<b>Address:</b> {p.address}", styles["Normal"]))
     story.append(Paragraph(f"<b>Grade:</b> {result['grade']} &nbsp;&nbsp; <b>Score:</b> {result['score']:.1f} &nbsp;&nbsp; <b>Verdict:</b> {result['verdict']}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Kill Switch:</b> {result['kill_switch']} &nbsp;&nbsp; <b>Stress DSCR:</b> {dscr:.2f} (rent -20%)", styles["Normal"]))
-    story.append(Spacer(1, 12))
-
+    story.append(Paragraph(f"<b>Stress DSCR:</b> {nums['dscr_stress']:.2f} (rent -20%) &nbsp;&nbsp; <b>Cap Rate:</b> {nums['cap_rate']*100:.2f}% &nbsp;&nbsp; <b>CoC:</b> {nums['coc_return']*100:.2f}%", styles["Normal"]))
+    story.append(Spacer(1, 10))
     data = [
         ["Metric", "Value"],
         ["Price", f"${p.price:,.0f}"],
+        ["Down Payment", f"{p.down_payment_pct:.1f}%"],
+        ["Interest Rate", f"{p.interest_rate_pct:.2f}%"],
+        ["Term", f"{p.term_years} years"],
         ["Monthly Rent", f"${p.monthly_rent:,.0f}"],
         ["Monthly Expenses", f"${p.monthly_expenses:,.0f}"],
-        ["Loan Payment", f"${p.loan_payment:,.0f}"],
-        ["Vacancy Rate", f"{p.vacancy_rate:.0%}"],
-        ["Replacement Cost", f"${p.replacement_cost:,.0f}"],
+        ["Vacancy Rate", f"{p.vacancy_rate*100:.1f}%"],
+        ["Loan Payment (est.)", f"${nums['loan_payment']:,.0f}"],
+        ["NOI (annual)", f"${nums['noi_year']:,.0f}"],
         ["Days on Market", str(p.days_on_market)],
-        ["Job Diversity Index", f"{p.job_diversity_index:.2f}"],
     ]
     table = Table(data, hAlign="LEFT")
     table.setStyle(TableStyle([
@@ -332,217 +472,335 @@ def build_pdf(path: str, p: PropertyData, result: dict, strengths: list, risks: 
         ("PADDING", (0,0), (-1,-1), 6),
     ]))
     story.append(table)
-    story.append(Spacer(1, 12))
-
+    story.append(Spacer(1, 10))
     story.append(Paragraph("Top Strengths", styles["Heading2"]))
     for s in strengths:
         story.append(Paragraph(f"• {s}", styles["Normal"]))
-    story.append(Spacer(1, 8))
-
+    story.append(Spacer(1, 6))
     story.append(Paragraph("Top Risks / Flags", styles["Heading2"]))
     for r in risks:
         story.append(Paragraph(f"• {r}", styles["Normal"]))
-
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Data Notes", styles["Heading2"]))
+    for n in data_notes:
+        story.append(Paragraph(f"• {n}", styles["Normal"]))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Disclaimer: This report is for informational purposes and is not financial advice. Verify all inputs and assumptions.", styles["Normal"]))
     doc.build(story)
 
-# ----------------------------
-# Payments (Stripe Payment Link)
-# ----------------------------
 def render_paywall():
-    st.warning("You’ve used your free analyses. Subscribe to unlock unlimited reports.")
+    st.markdown('<div class="aire-card">', unsafe_allow_html=True)
+    st.markdown("### Upgrade to Pro")
+    st.write("You’ve used your free credits. Upgrade to keep running unlimited analyses and generating reports.")
     pay_link = st.secrets.get("STRIPE_PAYMENT_LINK_URL", "")
     if pay_link:
         st.link_button("Subscribe (Stripe)", pay_link)
     else:
         st.info("Add STRIPE_PAYMENT_LINK_URL in Streamlit secrets to enable payments.")
-    st.caption("Tip: Payment Link is the fastest investor-demo paywall.")
+    st.caption("Automatic unlock via Stripe webhooks is the next upgrade.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-def demo_unlock_controls(email: str):
+def demo_admin_unlock(email: str):
     unlock_code = st.secrets.get("ADMIN_UNLOCK_CODE", "")
-    with st.expander("Demo Admin (optional)", expanded=False):
-        st.caption("For demos only: unlock an email without building Stripe webhooks yet.")
-        code = st.text_input("Admin unlock code", type="password")
-        if st.button("Unlock this email") and unlock_code and code == unlock_code:
-            set_paid(email, 1)
-            st.success("Unlocked. Run again.")
-        if not unlock_code:
-            st.caption("Set ADMIN_UNLOCK_CODE in secrets to enable this.")
+    with st.expander("Admin (demo only)", expanded=False):
+        st.caption("Unlock a user during testing if you haven’t added webhooks yet.")
+        code = st.text_input("Admin unlock code", type="password", key="admin_code")
+        if st.button("Unlock this account"):
+            if unlock_code and code == unlock_code:
+                set_paid(email, 1)
+                st.success("Unlocked. Refresh the page.")
+            else:
+                st.error("Invalid unlock code.")
 
 # ----------------------------
-# Header
+# Header + sidebar
 # ----------------------------
 st.markdown(
     f"""
-    <div class="aire-header">
-      <div class="aire-title">{APP_NAME} — Property Underwriter</div>
-      <div class="aire-sub">Paste a listing link → auto-fill real data → A–F grade + investment memo (PDF).</div>
+    <div class="aire-hero">
+      <div class="aire-title">{APP_NAME}</div>
+      <div class="aire-sub">{APP_TAGLINE}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 st.write("")
 
-# Sidebar controls
 with st.sidebar:
-    st.markdown(f"### {APP_NAME} Controls")
-    st.caption("Keep it simple during the pitch.")
+    st.markdown(f"## {APP_NAME}")
+    st.caption("Real underwriting • Clean workflow • Saved history")
+    page = st.radio("Navigate", ["Analyze", "History", "Account", "About"], index=0)
+    st.divider()
+    st.caption("Status")
+    st.write(f"Estated: {'✅' if bool(st.secrets.get('ESTATED_TOKEN','')) else '❌'}")
+    st.write(f"ATTOM: {'✅' if bool(st.secrets.get('ATTOM_APIKEY','')) else '❌'}")
+    st.write(f"Stripe: {'✅' if bool(st.secrets.get('STRIPE_PAYMENT_LINK_URL','')) else '❌'}")
+
+# ----------------------------
+# Account identity (simple email)
+# ----------------------------
+st.session_state.setdefault("email", "")
+
+# Top bar for identity
+c1, c2 = st.columns([2, 1])
+with c1:
+    email_in = st.text_input("Email", value=st.session_state["email"], placeholder="you@example.com")
+    if email_in:
+        st.session_state["email"] = email_in
+with c2:
     rate_env = st.selectbox("Rate environment", ["HIGH", "NORMAL"], index=0)
-    st.write("")
-    st.markdown("**Real Data Keys**")
-    st.write(f"- Estated: {'✅' if bool(st.secrets.get('ESTATED_TOKEN','')) else '❌'}")
-    st.write(f"- ATTOM: {'✅' if bool(st.secrets.get('ATTOM_APIKEY','')) else '❌'}")
-    st.write("")
-    st.markdown("**Payments**")
-    st.write(f"- Stripe link: {'✅' if bool(st.secrets.get('STRIPE_PAYMENT_LINK_URL','')) else '❌'}")
-    st.caption("No Zillow scraping. Address only.")
 
-# Main: Step 1
-colL, colR = st.columns([2, 1], gap="large")
+if not st.session_state["email"]:
+    st.info("Enter your email to continue.")
+    st.stop()
 
-with colL:
+user = get_user(st.session_state["email"])
+st.write("")
+
+# ============================
+# PAGES
+# ============================
+if page == "Analyze":
+    if (not user["paid"]) and (user["credits"] < CREDIT_COST_PER_ANALYSIS):
+        render_paywall()
+        demo_admin_unlock(st.session_state["email"])
+        st.stop()
+
     st.markdown('<div class="aire-card">', unsafe_allow_html=True)
-    st.markdown("### 1) Paste Listing Link")
-    email = st.text_input("Email (usage + subscription)", placeholder="you@example.com")
-    if not email:
-        st.info("Enter your email to start.")
+    st.markdown("### Analyze a property")
+    st.caption("Paste a listing link (optional), confirm address, and run underwriting. Your results are saved in History.")
+
+    colA, colB = st.columns([2, 1], gap="large")
+
+    with colA:
+        listing_url = st.text_input("Listing URL (optional)", placeholder="https://www.zillow.com/...")
+        auto_addr = extract_address_from_url(listing_url) if listing_url else None
+        address = st.text_input("Property address", value=(auto_addr or ""), placeholder="123 Main St, City, ST 12345")
+
+        b1, b2 = st.columns([1, 2])
+        with b1:
+            do_autofill = st.button("✨ Auto-fill")
+        with b2:
+            st.caption("Auto-fill uses Estated/ATTOM if configured. Otherwise, you’ll enter values manually.")
+
+        data_notes = []
+        prefill = st.session_state.get("prefill", {})
+        if do_autofill and address.strip():
+            with st.spinner("Fetching property data..."):
+                prefill, data_notes = smart_prefill(address.strip())
+            st.session_state["prefill"] = prefill
+            st.session_state["data_notes"] = data_notes
+        else:
+            data_notes = st.session_state.get("data_notes", ["Manual mode."])
+            prefill = st.session_state.get("prefill", {})
+
+    with colB:
+        st.markdown("**Plan**")
+        if user["paid"]:
+            st.markdown('<span class="aire-pill">PRO</span>', unsafe_allow_html=True)
+            st.write("Unlimited analyses")
+        else:
+            st.markdown('<span class="aire-pill-warn">FREE</span>', unsafe_allow_html=True)
+            st.write(f"Credits remaining: **{user['credits']}**")
+        st.markdown("**Outputs**")
+        st.write("• Grade & Verdict")
+        st.write("• NOI, Cap Rate, CoC")
+        st.write("• Stress DSCR")
+        st.write("• PDF report")
+        st.write("• Saved history")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+
+    st.markdown('<div class="aire-card">', unsafe_allow_html=True)
+    st.markdown("### Inputs")
+
+    def v(key, default):
+        val = prefill.get(key)
+        return default if val is None else val
+
+    c1, c2, c3, c4 = st.columns(4)
+    price = c1.number_input("Price ($)", min_value=0.0, value=float(v("price", 400000.0)), step=1000.0)
+    down_payment_pct = c2.number_input("Down payment (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
+    interest_rate_pct = c3.number_input("Interest rate (%)", min_value=0.0, max_value=30.0, value=7.25, step=0.05)
+    term_years = c4.number_input("Term (years)", min_value=1, max_value=40, value=30, step=1)
+
+    d1, d2, d3, d4 = st.columns(4)
+    monthly_rent = d1.number_input("Monthly rent ($)", min_value=0.0, value=3000.0, step=50.0)
+    monthly_expenses = d2.number_input("Monthly expenses ($)", min_value=0.0, value=1100.0, step=50.0)
+    vacancy_rate = d3.slider("Vacancy rate", min_value=0.0, max_value=0.25, value=0.08, step=0.01)
+    days_on_market = d4.number_input("Days on market", min_value=0, value=int(v("days_on_market", 45)), step=1)
+
+    e1, e2, e3, e4 = st.columns(4)
+    replacement_cost = e1.number_input("Replacement cost ($)", min_value=0.0, value=float(v("replacement_cost", 450000.0)), step=1000.0)
+    job_div = e2.slider("Job diversity (0–1)", min_value=0.0, max_value=1.0, value=0.74, step=0.01)
+    reg_risk = e3.checkbox("Rent regulation risk", value=False)
+    stress_rent_cut = e4.slider("Extra rent stress", min_value=0.0, max_value=0.30, value=0.00, step=0.01,
+                                help="Optional: extra rent cut beyond baseline -20% for your own stress testing.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+
+    st.markdown('<div class="aire-card">', unsafe_allow_html=True)
+    st.markdown("### Results")
+
+    if st.button("✅ Run underwriting", type="primary"):
+        if not spend_credit(st.session_state["email"], CREDIT_COST_PER_ANALYSIS):
+            st.error("No credits remaining.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            render_paywall()
+            st.stop()
+
+        p = PropertyData(
+            address=address.strip() or "Unknown address",
+            price=price,
+            down_payment_pct=down_payment_pct,
+            interest_rate_pct=interest_rate_pct,
+            term_years=int(term_years),
+            monthly_rent=monthly_rent,
+            monthly_expenses=monthly_expenses,
+            vacancy_rate=vacancy_rate,
+            replacement_cost=replacement_cost,
+            days_on_market=int(days_on_market),
+            job_diversity_index=job_div,
+            rent_regulation_risk=reg_risk,
+        )
+
+        nums = compute_core_numbers(p)
+        dscr_display = nums["dscr_stress"] * (1 - stress_rent_cut)
+
+        weights = get_weights(rate_env)
+        metrics = calculate_metrics(p, nums)
+        flags = ai_flags(p, nums)
+        penalty = ai_penalty(flags)
+
+        killed = kill_switch(nums["dscr_stress"], p.rent_regulation_risk, p.days_on_market)
+        base_score = score(metrics, weights)
+        final_score = max(base_score * (1 - penalty), 0)
+        g, verdict = grade(final_score, killed)
+
+        strengths, risks = narrative_summary(p, nums, flags)
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Grade", g)
+        k2.metric("Score", f"{final_score:.1f}")
+        k3.metric("Verdict", verdict)
+        k4.metric("Stress DSCR", f"{dscr_display:.2f}")
+        k5.metric("Cap Rate", f"{nums['cap_rate']*100:.2f}%")
+
+        s1, s2 = st.columns(2, gap="large")
+        with s1:
+            st.markdown("**Strengths**")
+            for s in strengths:
+                st.write(f"• {s}")
+            st.write("")
+            st.markdown("**Key Numbers**")
+            st.write(f"NOI (annual): **{fmt_money(nums['noi_year'])}**")
+            st.write(f"Loan payment (est.): **{fmt_money(nums['loan_payment'])}/mo**")
+            st.write(f"Cash flow (est.): **{fmt_money(nums['cash_flow_month'])}/mo**")
+            st.write(f"Cash-on-cash: **{nums['coc_return']*100:.2f}%**")
+        with s2:
+            st.markdown("**Risks / Flags**")
+            for r in risks:
+                st.write(f"• {r}")
+            st.write("")
+            st.markdown("**Data Notes**")
+            for n in data_notes:
+                st.write(f"• {n}")
+
+        result = {
+            "grade": g,
+            "verdict": verdict,
+            "score": float(final_score),
+            "dscr": float(nums["dscr_stress"]),
+            "noi": float(nums["noi_year"]),
+            "cap_rate": float(nums["cap_rate"]),
+            "coc_return": float(nums["coc_return"]),
+            "kill_switch": bool(killed),
+            "ai_penalty": float(penalty),
+            "rate_env": rate_env,
+        }
+
+        payload = {
+            "property": asdict(p),
+            "numbers": nums,
+            "metrics": metrics,
+            "weights": weights,
+            "flags": flags,
+            "data_notes": data_notes,
+            "result": result,
+        }
+
+        save_analysis(st.session_state["email"], p.address, listing_url, result, payload)
+
+        pdf_name = f"AIRE_Report_{int(time.time())}.pdf"
+        build_pdf(pdf_name, p, nums, result, strengths, risks, data_notes)
+        with open(pdf_name, "rb") as f:
+            st.download_button("⬇️ Download PDF report", f, file_name=pdf_name, mime="application/pdf")
+
+        with st.expander("Details (audit trail)", expanded=False):
+            st.json(payload)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+    st.markdown(f'<div class="aire-disclaimer">Disclaimer: {APP_NAME} is informational and not financial advice. Always verify inputs and assumptions.</div>', unsafe_allow_html=True)
+
+elif page == "History":
+    st.markdown('<div class="aire-card">', unsafe_allow_html=True)
+    st.markdown("### History")
+    st.caption("Your last analyses are saved here.")
+
+    items = fetch_analyses(st.session_state["email"], limit=50)
+    if not items:
+        st.info("No analyses yet. Run one in Analyze.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
-    user = get_user(email)
-    analyses_left = max(FREE_ANALYSES - user["analyses_used"], 0)
+    for it in items[:20]:
+        cols = st.columns([2.2, 1.2, 0.8, 1.2, 1.0, 1.0, 1.0])
+        cols[0].write(f"**{it['address'] or 'Unknown'}**\n\n{ts_to_str(it['created_at'])}")
+        cols[1].write(it["verdict"])
+        cols[2].write(f"**{it['grade']}**")
+        cols[3].write(f"{it['score']:.1f}")
+        cols[4].write(f"{it['dscr']:.2f}")
+        cols[5].write(f"{it['cap_rate']*100:.2f}%")
+        cols[6].write(f"{it['coc_return']*100:.2f}%")
+        st.divider()
 
-    zlink = st.text_input("Listing URL", placeholder="https://www.zillow.com/...")
-    auto_addr = extract_address_from_url(zlink) if zlink else None
-    address = st.text_input("Confirm address", value=(auto_addr or ""), placeholder="123 Main St, City, ST 12345")
-
-    c1, c2, c3 = st.columns(3)
-    c1.markdown(f'<div class="aire-kpi"><b>Free left</b><br>{analyses_left}</div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="aire-kpi"><b>Subscribed</b><br>{"Yes" if user["paid"] else "No"}</div>', unsafe_allow_html=True)
-    c3.markdown(f'<div class="aire-kpi"><b>Rate env</b><br>{rate_env}</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-with colR:
+elif page == "Account":
     st.markdown('<div class="aire-card">', unsafe_allow_html=True)
-    st.markdown("### Investor Demo Script")
-    st.markdown('<span class="aire-chip">Clean</span><span class="aire-chip">Fast</span><span class="aire-chip">Credible</span>', unsafe_allow_html=True)
-    st.write("1) Paste link")
-    st.write("2) Auto-fill (real data)")
-    st.write("3) Analyze")
-    st.write("4) Download PDF")
-    st.write("5) Show Subscribe button")
+    st.markdown("### Account")
+    st.write(f"Signed in as: **{st.session_state['email']}**")
+    if user["paid"]:
+        st.markdown('<span class="aire-pill">PRO</span>', unsafe_allow_html=True)
+        st.write("Status: Subscribed")
+    else:
+        st.markdown('<span class="aire-pill-warn">FREE</span>', unsafe_allow_html=True)
+        st.write(f"Credits remaining: **{user['credits']}**")
+
+    st.write("")
+    st.markdown("**Upgrade**")
+    pay_link = st.secrets.get("STRIPE_PAYMENT_LINK_URL", "")
+    if pay_link:
+        st.link_button("Subscribe (Stripe)", pay_link)
+    else:
+        st.info("Add STRIPE_PAYMENT_LINK_URL in secrets to enable payments.")
+
+    st.write("")
+    demo_admin_unlock(st.session_state["email"])
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.write("")
-
-# Paywall
-if (not user["paid"]) and (user["analyses_used"] >= FREE_ANALYSES):
-    render_paywall()
-    demo_unlock_controls(email)
-    st.stop()
-
-# Step 2 Inputs
-st.markdown('<div class="aire-card">', unsafe_allow_html=True)
-st.markdown("### 2) Deal Inputs (Auto-fill + Quick Adjust)")
-
-prefill = st.session_state.get("prefill", {})
-
-b1, b2, b3 = st.columns([1, 1, 2])
-with b1:
-    autofill = st.button("✨ Auto-fill (real data)")
-with b2:
-    demo_fill = st.button("⚡ Load demo deal")
-with b3:
-    st.caption("Auto-fill uses Estated/ATTOM if configured; otherwise demo with manual inputs.")
-
-if autofill and address.strip():
-    st.session_state["prefill"] = smart_prefill(address.strip())
-    prefill = st.session_state["prefill"]
-
-if demo_fill:
-    st.session_state["prefill"] = {"price": 485000, "days_on_market": 28, "replacement_cost": 525000}
-    prefill = st.session_state["prefill"]
-
-def val(key, default):
-    v = prefill.get(key)
-    return default if v is None else v
-
-a, b, c = st.columns(3)
-price = a.number_input("Purchase Price ($)", min_value=0.0, value=float(val("price", 400000.0)), step=1000.0)
-monthly_rent = b.number_input("Monthly Rent ($)", min_value=0.0, value=3000.0, step=50.0)
-loan_payment = c.number_input("Monthly Loan Payment ($)", min_value=0.0, value=1850.0, step=50.0)
-
-d, e, f = st.columns(3)
-monthly_expenses = d.number_input("Monthly Expenses ($)", min_value=0.0, value=1100.0, step=50.0)
-vacancy_rate = e.slider("Vacancy Rate", min_value=0.0, max_value=0.25, value=0.08, step=0.01)
-days_on_market = f.number_input("Days on Market", min_value=0, value=int(val("days_on_market", 45)), step=1)
-
-g1, g2, g3 = st.columns(3)
-replacement_cost = g1.number_input("Replacement Cost ($)", min_value=0.0, value=float(val("replacement_cost", 450000.0)), step=1000.0)
-job_div = g2.slider("Job Diversity Index (0–1)", min_value=0.0, max_value=1.0, value=0.74, step=0.01)
-reg_risk = g3.checkbox("Rent regulation risk", value=False)
-
-st.markdown("</div>", unsafe_allow_html=True)
-st.write("")
-
-# Step 3 Analyze
-st.markdown('<div class="aire-card">', unsafe_allow_html=True)
-st.markdown("### 3) Analyze → Grade → Download Report")
-
-if st.button("✅ Analyze & Generate PDF", type="primary"):
-    p = PropertyData(
-        address=address.strip() or "Unknown address",
-        price=price,
-        monthly_rent=monthly_rent,
-        monthly_expenses=monthly_expenses,
-        loan_payment=loan_payment,
-        vacancy_rate=vacancy_rate,
-        replacement_cost=replacement_cost,
-        days_on_market=int(days_on_market),
-        job_diversity_index=job_div,
-        rent_regulation_risk=reg_risk,
-    )
-
-    killed = kill_switch(p)
-    metrics, dscr = calculate_metrics(p)
-    weights = get_weights(rate_env)
-    flags = ai_flags(p)
-    penalty = ai_penalty(flags)
-
-    base_score = score(metrics, weights)
-    final_score = max(base_score * (1 - penalty), 0)
-
-    g, verdict = grade(final_score, killed)
-    strengths, risks = narrative_summary(p, final_score, g, verdict, flags, dscr)
-
-    inc_usage(email)
-
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("Grade", g)
-    r2.metric("Score", f"{final_score:.1f}")
-    r3.metric("Verdict", verdict)
-    r4.metric("Stress DSCR", f"{dscr:.2f}")
-
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.markdown("**Top Strengths**")
-        for s in strengths:
-            st.write(f"• {s}")
-    with right:
-        st.markdown("**Top Risks / Flags**")
-        for r in risks:
-            st.write(f"• {r}")
-
-    pdf_name = f"AIRE_Report_{int(time.time())}.pdf"
-    build_pdf(pdf_name, p, {"score": final_score, "grade": g, "verdict": verdict, "kill_switch": killed}, strengths, risks, dscr)
-
-    with open(pdf_name, "rb") as f:
-        st.download_button("⬇️ Download PDF Investment Report", f, file_name=pdf_name, mime="application/pdf")
-
-    with st.expander("Underwriting details (for firms/investors)", expanded=False):
-        st.write("Weights:", weights)
-        st.write("Metrics (0–1):", metrics)
-        st.write("AI penalty:", round(penalty, 3))
-
-st.markdown("</div>", unsafe_allow_html=True)
-st.write("")
-st.caption("AIRE™ is deterministic underwriting. AI flags only reduce score; they never inflate it. Zillow is never scraped.")
+else:
+    st.markdown('<div class="aire-card">', unsafe_allow_html=True)
+    st.markdown("### About")
+    st.write("AIRE™ is a deterministic underwriting system with AI-style risk flagging and clean reporting.")
+    st.write("It is designed to be auditable: math drives scores; flags only reduce score (never inflate).")
+    st.write("")
+    st.markdown("**Roadmap**")
+    st.write("• Automated Stripe webhooks (true subscription unlock)")
+    st.write("• Rent comps module (range + confidence)")
+    st.write("• Portfolio analytics dashboard")
+    st.write("• Team accounts & shared workspaces")
+    st.markdown("</div>", unsafe_allow_html=True)
